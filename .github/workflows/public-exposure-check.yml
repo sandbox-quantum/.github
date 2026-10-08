@@ -160,7 +160,7 @@ jobs:
           python3 -I - <<'PY'
           import os, re, subprocess, sys
           base, head = os.environ["BASE_SHA"], os.environ["HEAD_SHA"]
-          corp = re.compile(r"(?i)[a-z0-9._%+-]*@([a-z0-9-]+\.)*(sandboxaq|sandboxquantum)\.com")
+          corp = re.compile(r"(?i)[a-z0-9._%+-]*@([a-z0-9-]+\.)*(sandboxaq|sandboxquantum|sandbox-quantum|sbt-ext)\.com")
           noreply = re.compile(r"(?i)^(([0-9]+\+)?[a-z0-9-]+(\[bot\])?@users\.noreply\.github\.com|noreply@github\.com)$")
           ident = re.compile(rb"^(author|committer) .*<([^>]*)> -?\d+ [+-]\d{4}$")
           def data(s): return str(s).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
@@ -199,7 +199,7 @@ jobs:
               for line in fails + warns:
                   f.write(f"- `{line}`\n")
               if fails:
-                  f.write("\nFix: set `git config user.email <id>+<login>@users.noreply.github.com`, drop corporate "
+                  f.write("\nFix: set `git config user.email <id>+<login>@users.noreply.github.com`, drop company (incl. contractor) "
                           "`Co-authored-by`/`Signed-off-by` trailers, rewrite the branch and force-push.\n")
           sys.exit(1 if fails else 0)
           PY

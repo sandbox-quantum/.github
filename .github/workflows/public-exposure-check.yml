@@ -1,0 +1,214 @@
+name: public-exposure-check
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-exposure-check-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: secrets and commit metadata
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve commit range
+        id: range
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MQ_BASE: ${{ github.event.merge_group.base_sha }}
+          MQ_HEAD: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          base="${PR_BASE:-${MQ_BASE:-}}"
+          head="${PR_HEAD:-${MQ_HEAD:-}}"
+          for sha in "$base" "$head"; do
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not resolve a base/head SHA for this event"; exit 1; }
+            git cat-file -e "${sha}^{commit}" 2>/dev/null || git fetch --no-tags --quiet origin "$sha"
+          done
+          {
+            echo "base=$base"
+            echo "head=$head"
+            echo "commits=$(git rev-list --count "$base..$head")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL "$url" -o gitleaks.tar.gz
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          install -D -m 0755 gitleaks "$RUNNER_TEMP/bin/gitleaks"
+          rm -f gitleaks.tar.gz gitleaks
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          python3 -c 'import sys, tomllib; assert sys.version_info >= (3, 11)'
+
+      - name: Secret scan of the PR's commits
+        id: secrets
+        env:
+          BASE_SHA: ${{ steps.range.outputs.base }}
+          HEAD_SHA: ${{ steps.range.outputs.head }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/exposure"
+          mkdir -p "$work"
+          git show "$BASE_SHA:.gitleaks.toml" > "$work/repo.toml" 2>/dev/null || : > "$work/repo.toml"
+          git show "$BASE_SHA:.gitleaksignore" > "$work/ignore" 2>/dev/null || : > "$work/ignore"
+          rm -f .gitleaksignore
+          python3 -I - "$work/repo.toml" "$work/effective.toml" <<'PY'
+          import json, sys, tomllib
+          src, dst = sys.argv[1], sys.argv[2]
+          try:
+              with open(src, "rb") as f:
+                  cfg = tomllib.load(f)
+          except tomllib.TOMLDecodeError as exc:
+              print(f"::error file=.gitleaks.toml::base branch .gitleaks.toml is not valid TOML ({exc}); fix it on the base branch first")
+              sys.exit(1)
+          ext = cfg.setdefault("extend", {})
+          for key in ("path", "url"):
+              if ext.pop(key, None):
+                  print(f"::warning::.gitleaks.toml extend.{key} is not followed by this check; built-in rules plus this file's own rules and allowlists are used")
+          ext["useDefault"] = True
+          if ext.get("disabledRules"):
+              print("::warning::.gitleaks.toml disables built-in rules: " + ", ".join(map(str, ext["disabledRules"])).replace("%", "%25"))
+
+          def value(v):
+              if isinstance(v, bool):
+                  return "true" if v else "false"
+              if isinstance(v, (int, float)):
+                  return repr(v)
+              if isinstance(v, str):
+                  return json.dumps(v, ensure_ascii=False)
+              if isinstance(v, list):
+                  return "[" + ", ".join(value(x) for x in v) + "]"
+              raise TypeError(f"unsupported TOML value {type(v).__name__}")
+
+          def emit(table, path, out):
+              key = lambda k: json.dumps(str(k))
+              for k, v in table.items():
+                  if not isinstance(v, dict) and not (isinstance(v, list) and v and all(isinstance(x, dict) for x in v)):
+                      out.append(f"{key(k)} = {value(v)}")
+              for k, v in table.items():
+                  sub = path + [key(k)]
+                  if isinstance(v, dict):
+                      out.append(f"\n[{'.'.join(sub)}]")
+                      emit(v, sub, out)
+                  elif isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
+                      for item in v:
+                          out.append(f"\n[[{'.'.join(sub)}]]")
+                          emit(item, sub, out)
+
+          lines = []
+          try:
+              emit(cfg, [], lines)
+          except TypeError as exc:
+              print(f"::error file=.gitleaks.toml::base branch .gitleaks.toml uses an unsupported value ({exc})")
+              sys.exit(1)
+          with open(dst, "w") as f:
+              f.write("\n".join(lines) + "\n")
+          PY
+          token="$(openssl rand -hex 16)"
+          echo "::stop-commands::$token"
+          rc=0
+          gitleaks git --no-banner --redact --log-level error --exit-code 0 \
+            --config "$work/effective.toml" --gitleaks-ignore-path "$work/ignore" --ignore-gitleaks-allow \
+            --log-opts "$BASE_SHA..$HEAD_SHA" \
+            --report-format json --report-path "$work/gitleaks.json" . || rc=$?
+          echo "::$token::"
+          [ "$rc" -eq 0 ] || { echo "::error::gitleaks failed to run (exit $rc)"; exit 1; }
+          python3 -I - "$work/gitleaks.json" <<'PY'
+          import json, os, re, sys
+          findings = json.load(open(sys.argv[1]))
+          def data(s): return str(s).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          def prop(s): return data(s).replace(":", "%3A").replace(",", "%2C")
+          def md(s): return re.sub(r"[^A-Za-z0-9._/@+=-]", "?", str(s))
+          rows = []
+          for x in findings:
+              print(f"::error file={prop(x['File'])},line={int(x['StartLine'])},title=gitleaks {prop(x['RuleID'])}::"
+                    f"{data(x['RuleID'])} in commit {data(x['Commit'][:12])}. Rewrite the commit to remove the secret and rotate it; "
+                    f"it is already public via this PR's refs.")
+              rows.append(f"| `{md(x['RuleID'])}` | `{md(x['File'])}:{int(x['StartLine'])}` | `{md(x['Commit'][:12])}` |")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"### Secret scan: {len(findings)} finding(s)\n\n")
+              if rows:
+                  f.write("| rule | location | commit |\n|---|---|---|\n" + "\n".join(rows) + "\n")
+          sys.exit(1 if findings else 0)
+          PY
+
+      - name: Commit metadata scan
+        if: ${{ !cancelled() && steps.range.outcome == 'success' }}
+        env:
+          BASE_SHA: ${{ steps.range.outputs.base }}
+          HEAD_SHA: ${{ steps.range.outputs.head }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import os, re, subprocess, sys
+          base, head = os.environ["BASE_SHA"], os.environ["HEAD_SHA"]
+          corp = re.compile(r"(?i)[a-z0-9._%+-]*@([a-z0-9-]+\.)*(sandboxaq|sandboxquantum|sandbox-quantum|sbt-ext)\.com")
+          noreply = re.compile(r"(?i)^(([0-9]+\+)?[a-z0-9-]+(\[bot\])?@users\.noreply\.github\.com|noreply@github\.com)$")
+          ident = re.compile(rb"^(author|committer) .*<([^>]*)> -?\d+ [+-]\d{4}$")
+          def data(s): return str(s).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          def safe(s): return re.sub(r"[^A-Za-z0-9._%+@\[\]-]", "?", s)
+          def prop(s): return data(s).replace(":", "%3A").replace(",", "%2C")
+          def git(*args): return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout
+          pr_files = set(git("diff", "--name-only", "--no-renames", f"{base}...{head}").splitlines())
+          def anchor(sha):
+              touched = git("diff-tree", "--no-commit-id", "--name-only", "--no-renames", "-r", "--root", sha).splitlines()
+              path = next((f for f in touched if f in pr_files), touched[0] if touched else "")
+              return f"file={prop(path)},line=1," if path else ""
+
+          shas = subprocess.run(["git", "rev-list", "--reverse", f"{base}..{head}"],
+                                check=True, capture_output=True, text=True).stdout.split()
+          batch = subprocess.run(["git", "cat-file", "--batch"], input=("\n".join(shas) + "\n").encode(),
+                                 check=True, capture_output=True).stdout
+          fails, warns, pos = [], [], 0
+          for sha in shas:
+              header_end = batch.index(b"\n", pos)
+              size = int(batch[pos:header_end].split()[2])
+              raw = batch[header_end + 1: header_end + 1 + size]
+              pos = header_end + 1 + size + 1
+              headers, _, message = raw.partition(b"\n\n")
+              short, where = sha[:12], anchor(sha)
+              for line in headers.split(b"\n"):
+                  m = ident.match(line)
+                  if not m:
+                      continue
+                  role, email = m.group(1).decode(), m.group(2).decode("utf-8", "replace")
+                  if corp.search(email):
+                      fails.append((where, f"{short}: {role} email {safe(email)} is a corporate address"))
+                  elif not noreply.match(email):
+                      warns.append((where, f"{short}: {role} email {safe(email)} is not a GitHub noreply address"))
+              for hit in sorted({m.group(0) for m in corp.finditer(message.decode("utf-8", "replace"))}):
+                  fails.append((where, f"{short}: commit message contains corporate address {safe(hit)}"))
+
+          for where, w in warns:
+              print(f"::warning {where}title=commit metadata::{data(w)}")
+          for where, e in fails:
+              print(f"::error {where}title=commit metadata::{data(e)}")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"### Commit metadata: {len(shas)} commit(s), {len(fails)} failure(s), {len(warns)} warning(s)\n\n")
+              for _, line in fails + warns:
+                  f.write(f"- `{line}`\n")
+              if fails:
+                  f.write("\nFix: set `git config user.email <id>+<login>@users.noreply.github.com`, drop company (incl. contractor) "
+                          "`Co-authored-by`/`Signed-off-by` trailers, rewrite the branch and force-push.\n")
+          sys.exit(1 if fails else 0)
+          PY

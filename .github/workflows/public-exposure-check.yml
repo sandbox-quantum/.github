@@ -167,6 +167,13 @@ jobs:
           ident = re.compile(rb"^(author|committer) .*<([^>]*)> -?\d+ [+-]\d{4}$")
           def data(s): return str(s).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
           def safe(s): return re.sub(r"[^A-Za-z0-9._%+@\[\]-]", "?", s)
+          def prop(s): return data(s).replace(":", "%3A").replace(",", "%2C")
+          def git(*args): return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout
+          pr_files = set(git("diff", "--name-only", "--no-renames", f"{base}...{head}").splitlines())
+          def anchor(sha):
+              touched = git("diff-tree", "--no-commit-id", "--name-only", "--no-renames", "-r", "--root", sha).splitlines()
+              path = next((f for f in touched if f in pr_files), touched[0] if touched else "")
+              return f"file={prop(path)},line=1," if path else ""
 
           shas = subprocess.run(["git", "rev-list", "--reverse", f"{base}..{head}"],
                                 check=True, capture_output=True, text=True).stdout.split()
@@ -179,26 +186,26 @@ jobs:
               raw = batch[header_end + 1: header_end + 1 + size]
               pos = header_end + 1 + size + 1
               headers, _, message = raw.partition(b"\n\n")
-              short = sha[:12]
+              short, where = sha[:12], anchor(sha)
               for line in headers.split(b"\n"):
                   m = ident.match(line)
                   if not m:
                       continue
                   role, email = m.group(1).decode(), m.group(2).decode("utf-8", "replace")
                   if corp.search(email):
-                      fails.append(f"{short}: {role} email {safe(email)} is a corporate address")
+                      fails.append((where, f"{short}: {role} email {safe(email)} is a corporate address"))
                   elif not noreply.match(email):
-                      warns.append(f"{short}: {role} email {safe(email)} is not a GitHub noreply address")
+                      warns.append((where, f"{short}: {role} email {safe(email)} is not a GitHub noreply address"))
               for hit in sorted({m.group(0) for m in corp.finditer(message.decode("utf-8", "replace"))}):
-                  fails.append(f"{short}: commit message contains corporate address {safe(hit)}")
+                  fails.append((where, f"{short}: commit message contains corporate address {safe(hit)}"))
 
-          for w in warns:
-              print(f"::warning title=commit metadata::{data(w)}")
-          for e in fails:
-              print(f"::error title=commit metadata::{data(e)}")
+          for where, w in warns:
+              print(f"::warning {where}title=commit metadata::{data(w)}")
+          for where, e in fails:
+              print(f"::error {where}title=commit metadata::{data(e)}")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
               f.write(f"### Commit metadata: {len(shas)} commit(s), {len(fails)} failure(s), {len(warns)} warning(s)\n\n")
-              for line in fails + warns:
+              for _, line in fails + warns:
                   f.write(f"- `{line}`\n")
               if fails:
                   f.write("\nFix: set `git config user.email <id>+<login>@users.noreply.github.com`, drop company (incl. contractor) "

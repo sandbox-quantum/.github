@@ -65,6 +65,7 @@ jobs:
         env:
           BASE_SHA: ${{ steps.range.outputs.base }}
           HEAD_SHA: ${{ steps.range.outputs.head }}
+          GIT_ATTR_SOURCE: 4b825dc642cb6eb9a060e54bf8d69288fbee4904
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/exposure"

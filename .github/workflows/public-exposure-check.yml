@@ -158,11 +158,25 @@ jobs:
         env:
           BASE_SHA: ${{ steps.range.outputs.base }}
           HEAD_SHA: ${{ steps.range.outputs.head }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           python3 -I - <<'PY'
           import os, re, subprocess, sys
           base, head = os.environ["BASE_SHA"], os.environ["HEAD_SHA"]
+          import json, urllib.request
+          def email_exempt():
+              req = urllib.request.Request(f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['REPO']}/properties/values",
+                                           headers={"Authorization": f"Bearer {os.environ['GH_TOKEN']}", "Accept": "application/vnd.github+json"})
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as r:
+                      props = json.load(r)
+              except Exception as e:
+                  print(f"::warning title=commit metadata::could not read repository properties ({type(e).__name__}); applying the strict email rule")
+                  return False
+              return any(p.get("property_name") == "email-privacy-exempt" and p.get("value") == "true" for p in props)
+          exempt = email_exempt()
           corp = re.compile(r"(?i)[a-z0-9._%+-]*@([a-z0-9-]+\.)*(sandboxaq|sandboxquantum|sandbox-quantum|sbt-ext)\.com")
           noreply = re.compile(r"(?i)^(([0-9]+\+)?[a-z0-9-]+(\[bot\])?@users\.noreply\.github\.com|noreply@github\.com)$")
           ident = re.compile(rb"^(author|committer) .*<([^>]*)> -?\d+ [+-]\d{4}$")
@@ -194,11 +208,11 @@ jobs:
                       continue
                   role, email = m.group(1).decode(), m.group(2).decode("utf-8", "replace")
                   if corp.search(email):
-                      fails.append((where, f"{short}: {role} email {safe(email)} is a corporate address"))
+                      (warns if exempt else fails).append((where, f"{short}: {role} email {safe(email)} is a corporate address"))
                   elif not noreply.match(email):
                       warns.append((where, f"{short}: {role} email {safe(email)} is not a GitHub noreply address"))
               for hit in sorted({m.group(0) for m in corp.finditer(message.decode("utf-8", "replace"))}):
-                  fails.append((where, f"{short}: commit message contains corporate address {safe(hit)}"))
+                  (warns if exempt else fails).append((where, f"{short}: commit message contains corporate address {safe(hit)}"))
 
           for where, w in warns:
               print(f"::warning {where}title=commit metadata::{data(w)}")
@@ -206,6 +220,8 @@ jobs:
               print(f"::error {where}title=commit metadata::{data(e)}")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
               f.write(f"### Commit metadata: {len(shas)} commit(s), {len(fails)} failure(s), {len(warns)} warning(s)\n\n")
+              if exempt:
+                  f.write("This repository is marked `email-privacy-exempt`, so corporate addresses are warnings here.\n\n")
               for _, line in fails + warns:
                   f.write(f"- `{line}`\n")
               if fails:
